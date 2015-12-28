@@ -1,19 +1,11 @@
 local range_in = null;
 local state = null;
+local batt_volts = 0.0;
+local batt_soc_percent = 0.0;
 
 const html1 = @"<!DOCTYPE html>
 <html lang=""en"">
     <head>
-        <meta charset=""utf-8"">
-        <meta name=""viewport"" content=""width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0"">
-        <meta name=""apple-mobile-web-app-capable"" content=""yes"">
-        <script src=""http://code.jquery.com/jquery-1.9.1.min.js""></script>
-        <script src=""http://code.jquery.com/jquery-migrate-1.2.1.min.js""></script>
-        <script src=""http://d2c5utp5fpfikz.cloudfront.net/2_3_1/js/bootstrap.min.js""></script>
-        
-        <link href=""//d2c5utp5fpfikz.cloudfront.net/2_3_1/css/bootstrap.min.css"" rel=""stylesheet"">
-        <link href=""//d2c5utp5fpfikz.cloudfront.net/2_3_1/css/bootstrap-responsive.min.css"" rel=""stylesheet"">
-
         <title>Pooper Trooper</title>
     </head>
     <body>
@@ -24,6 +16,10 @@ const html1 = @"<!DOCTYPE html>
 const html2 = @" inches</h3>
                 <h3>State: ";
 const html3 = @"</h3>
+                <h3>Batt Voltage: ";
+const html4 = @"volts</h3>
+                <h3>Batt SoC: ";
+const html5 = @"%%</h3>
             </div>
         </div>
     </body>
@@ -32,7 +28,11 @@ const html3 = @"</h3>
 
 http.onrequest(function(request, response) { 
     if (request.body == "") {
-        local html = format(html1 + ("%s", range_in) + html2 + ("%s", state) + html3);
+        local html = format( html1 +
+                            ("%s", range_in) + html2 +
+                            ("%s", state) + html3 +
+                            ("%s", batt_volts) + html4 +
+                            ("%s", batt_soc_percent) + html5 );
         response.send(200, html);
     }
     else {
@@ -42,3 +42,4 @@ http.onrequest(function(request, response) {
 
 device.on("range", function(r){range_in=r;});
 device.on("state", function(s){state=s;});
+device.on("battery_status", function(b){batt_soc_percent=b[0]; batt_volts=b[1]})

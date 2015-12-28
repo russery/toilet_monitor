@@ -1,5 +1,54 @@
-local DEBUG = true;
+local DEBUG = false;
 
+/*
+range_sensor implements the interface to the HC-SR04 ultrasonic range sensor
+*/
+class range_sensor {
+    trig_ = null;
+    echo_ = null;
+
+    constructor(trig_pin, echo_pin) {
+        trig_ = trig_pin;
+        echo_ = echo_pin;
+    }
+
+    function range_in() {
+        // get the start time
+        local start_ms = hardware.millis();
+        
+        // send trigger pulse
+        trig_.write(0);
+        trig_.write(1);
+        trig_.write(0);
+        
+        // Wait for the echo pulse to start
+        while(echo_.read() == 0){
+            if ((hardware.millis() - start_ms) > 500) {
+                // TODO handle millis() rollover intelligently
+                if (DEBUG) server.log("timeout on pulse start");
+                start_ms = hardware.millis();
+                break;
+            }
+        }
+        local echobegin_us = hardware.micros();
+        // Wait for the echo pulse to end
+        while(echo_.read() == 1){
+            if ((hardware.millis() - start_ms) > 500){
+                // TODO handle invalid ranges intelligently
+                if (DEBUG) server.log("timeout on pulse end");
+                break;
+            }
+        }
+        local echolen_us = hardware.micros() - echobegin_us;
+        
+        return (echolen_us / 148.0);
+    }
+};
+
+/*
+detector is a state machine used to detect the presence of a person in front of the
+toilet monitor.
+*/
 enum STATE {
     nobody = "nobody",
     pee = "pee",
@@ -7,55 +56,74 @@ enum STATE {
     error = "error"
 }
 class detector {
-    static MIN_RANGE = 3.0;
-    static MAX_RANGE_POO = 8.0;
-    static MAX_RANGE_PEE = 89.0;
-    static MAX_RANGE = 100.0;
-    static COUNT_THRESH = 4; // number of samples that must fall in a range bin
-    
-    pee_count = 0;
-    poo_count = 0;
+    min_range = 3.0;
+    max_range_poo = 8.0;
+    max_range_pee = 89.0;
+    max_range = 100.0;
+    count_thresh = 4; // number of samples that must fall in a range bin
     state = STATE.nobody;
+
+    sensor_ = 1234;
+    pee_count_ = 0;
+    poo_count_ = 0;
+    prev_state_ = STATE.nobody;
     
-    constructor(){
-        pee_count = 0;
-        poo_count = 0;
-        state = STATE.nobody;
+    /*
+    requires a range sensor to be passed in
+    */
+    constructor(rs){
+        sensor_ = rs;
     }
 
-    // updates the state and returns it to the caller
+    /*
+    checks the current range, sees if a person is present, and then checks if the 
+    person present status has changed since last called.
+    returns true if the status has changed
+    */
+    function changed() {
+        state = detect_person(sensor_.range_in());
+        if (prev_state_ != state) {
+            prev_state_ = state;
+            return true;
+        }
+        return false;
+    }
+
+    /*
+    updates the state and returns it to the caller
+    */
     function detect_person(range_in) {
-        if ((range_in < MIN_RANGE) || (range_in > MAX_RANGE)) {
+        if ((range_in < min_range) || (range_in > max_range)) {
             // range is invalid
             if (DEBUG) server.log("error: unexpected range value: " + range_in);
             state = STATE.error;
-            pee_count = 0;
-            poo_count = 0;
+            pee_count_ = 0;
+            poo_count_ = 0;
         }
-        else if (range_in < MAX_RANGE_POO) {
+        else if (range_in < max_range_poo) {
             // range is valid and within poop range
-            poo_count++;
-            if (poo_count > COUNT_THRESH) {
+            poo_count_++;
+            if (poo_count_ > count_thresh) {
                 state = STATE.poop;
-                poo_count = COUNT_THRESH;
-                pee_count = 0;
+                poo_count_ = count_thresh;
+                pee_count_ = 0;
             }
         }
-        else if (range_in < MAX_RANGE_PEE) {
+        else if (range_in < max_range_pee) {
             // range is valid and in pee range
-            pee_count++;
-            if (pee_count > COUNT_THRESH) {
+            pee_count_++;
+            if (pee_count_ > count_thresh) {
                 state = STATE.pee;
-                pee_count = COUNT_THRESH;
-                poo_count = 0;
+                pee_count_ = count_thresh;
+                poo_count_ = 0;
             }
         }
         else {
-            poo_count--;
-            pee_count--;
-            if ((poo_count < 0) || (pee_count < 0)) {
-                poo_count = 0;
-                pee_count = 0;
+            poo_count_--;
+            pee_count_--;
+            if ((poo_count_ < 0) || (pee_count_ < 0)) {
+                poo_count_ = 0;
+                pee_count_ = 0;
                 state = STATE.nobody;
             }
         }
@@ -63,6 +131,9 @@ class detector {
     }
 };
 
+/*
+batt_monitor implements the interface to the MAX17043 SoC monitor.
+*/
 class batt_monitor {
     static I2C_ADDR = 0x6C;
     // register definitions:
@@ -74,6 +145,7 @@ class batt_monitor {
     static REG_COMMAND = "\xFE";
 
     i2c_ = null;
+    prev_soc = 0.0;
 
     constructor(i2c_instance) {
         i2c_ = i2c_instance;
@@ -126,7 +198,23 @@ class batt_monitor {
         if (DEBUG) server.log("cell voltage: " + voltage);
         return voltage
     }
-    
+
+    /*
+    returns true if the SoC has changed appreciably since this function last returned true
+    this allows the system to only take action on large soc changes
+    */
+    function changed() {
+        const HYSTERESIS_PERCENT = 2.5; // only report a change if SoC has changed by more than this from last update
+        local soc = charge_percent();
+        if (soc != null) {
+            if (math.abs(soc - prev_soc) > HYSTERESIS_PERCENT) {
+                prev_soc = soc;
+                return true;
+            }
+        }
+        return false; // note that we also get here if the SoC reading is invalid
+    }
+
     /* 
     reads the silicon version of the SoC monitor
     this is mostly useful as a debug tool to make sure the IC is connected and working
@@ -158,49 +246,9 @@ class batt_monitor {
     }
 };
 
-class range_sensor {
-    
-    trig_ = null;
-    echo_ = null;
-
-    constructor(trig_pin, echo_pin) {
-        trig_ = trig_pin;
-        echo_ = echo_pin;
-    }
-
-    function range_in() {
-        // get the start time
-        local start_ms = hardware.millis();
-        
-        // send trigger pulse
-        trig_.write(0);
-        trig_.write(1);
-        trig_.write(0);
-        
-        // Wait for the echo pulse to start
-        while(echo_.read() == 0){
-            if ((hardware.millis() - start_ms) > 500) {
-                // TODO handle millis() rollover intelligently
-                if (DEBUG) server.log("timeout on pulse start");
-                start_ms = hardware.millis();
-                break;
-            }
-        }
-        local echobegin_us = hardware.micros();
-        // Wait for the echo pulse to end
-        while(echo_.read() == 1){
-            if ((hardware.millis() - start_ms) > 500){
-                // TODO handle invalid ranges intelligently
-                if (DEBUG) server.log("timeout on pulse end");
-                break;
-            }
-        }
-        local echolen_us = hardware.micros() - echobegin_us;
-        
-        return (echolen_us / 148.0);
-    }
-};
-
+/*
+performs setup of all hardware pins and system states
+*/
 function setup() {
     // only connect to the server by default in debug mode, to reduce power draw
     if (DEBUG) server.connect();
@@ -220,32 +268,44 @@ function setup() {
 // ------------------------------------------
 // MAIN PROGRAM ENTRY POINT
 // ------------------------------------------
+
+// initialize hardware:
 setup();
+
+// instantiate objects:
 local rs = range_sensor(trig, echo);
-local d = detector();
+local d = detector(rs.weakref());
 local soc = batt_monitor(i2c);
-local prev_state = STATE.nobody;
-local curr_state = STATE.nobody;
+
 function mainloop() {
-    local range_in = rs.range_in();
-    
-    local cell_soc = soc.charge_percent();
+    local cell_soc = 0.0;
+    local cell_volts = 0.0;
 
     // detect state transitions
-    prev_state = curr_state;
-    curr_state = d.detect_person(range_in);
-    if(curr_state != prev_state) {
+    if(d.changed()) {
         // connect to server (if we're not already), and wait for 
         // connection to complete
         if (!DEBUG) server.connect();
         while (!server.isconnected());
-        server.log(curr_state)
-        agent.send("state", curr_state);
+        server.log(d.state)
+        agent.send("state", d.state);
         if (!DEBUG) server.disconnect();
+    }   
+
+    if (soc.changed() || DEBUG) {
+        cell_soc = soc.charge_percent();
+        cell_volts = soc.voltage();
+        agent.send("battery_status", [cell_soc, cell_volts]);
     }
+
     
-    if (DEBUG) agent.send("range", range_in);
-    if (DEBUG) server.log("range " + range_in + " inches")
+    if (DEBUG) {
+        local range_in = rs.range_in();
+        agent.send("range", range_in);
+        server.log("range " + range_in + " inches");
+    }
+
+    // sleep till next loop iteration
     imp.wakeup(1.0, mainloop); 
 }
 mainloop();
