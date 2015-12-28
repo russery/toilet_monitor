@@ -22,6 +22,8 @@ const html1 = @"<!DOCTYPE html>
                 <h1>Toilet Range<h1>
                 <h3>Range: ";
 const html2 = @" inches</h3>
+                <h3>State: ";
+const html3 = @"</h3>
             </div>
         </div>
     </body>
@@ -30,7 +32,7 @@ const html2 = @" inches</h3>
 
 http.onrequest(function(request, response) { 
     if (request.body == "") {
-        local html = format(html1 + ("%s", range_in) + html2);
+        local html = format(html1 + ("%s", range_in) + html2 + ("%s", state) + html3);
         response.send(200, html);
     }
     else {
