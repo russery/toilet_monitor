@@ -1,9 +1,22 @@
-local DEBUG = false;
+DEBUG <- false;
+
+/*
+debug printing function to be used only during live debugging
+there should be no calls to this left in code, this is a live
+debugging tool only
+*/
+function debugprint(string) {
+    if (!server.isconnected()) server.connect();
+    while (!server.isconnected());
+    server.log("DEBUG: "  + string);
+}
 
 /*
 range_sensor implements the interface to the HC-SR04 ultrasonic range sensor
 */
 class range_sensor {
+    range_in = 0.0;
+    
     trig_ = null;
     echo_ = null;
 
@@ -12,7 +25,7 @@ class range_sensor {
         echo_ = echo_pin;
     }
 
-    function range_in() {
+    function range() {
         // get the start time
         local start_ms = hardware.millis();
         
@@ -41,7 +54,8 @@ class range_sensor {
         }
         local echolen_us = hardware.micros() - echobegin_us;
         
-        return (echolen_us / 148.0);
+        range_in = (echolen_us / 148.0);
+        return range_in;
     }
 };
 
@@ -54,19 +68,20 @@ enum STATE {
     pee = "pee",
     poop = "poop",
     error = "error"
+    init = "init"
 }
 class detector {
     min_range = 3.0;
-    max_range_poo = 8.0;
-    max_range_pee = 89.0;
-    max_range = 100.0;
+    max_range_poo = 30.0;
+    max_range_pee = 40.0;
+    max_range = 2000.0;
     count_thresh = 4; // number of samples that must fall in a range bin
-    state = STATE.nobody;
+    state = STATE.init;
 
     sensor_ = 1234;
     pee_count_ = 0;
     poo_count_ = 0;
-    prev_state_ = STATE.nobody;
+    prev_state_ = STATE.init;
     
     /*
     requires a range sensor to be passed in
@@ -81,7 +96,7 @@ class detector {
     returns true if the status has changed
     */
     function changed() {
-        state = detect_person(sensor_.range_in());
+        state = detect_person(sensor_.range());
         if (prev_state_ != state) {
             prev_state_ = state;
             return true;
@@ -174,7 +189,7 @@ class batt_monitor {
     function charge_percent() {
         local soc = i2c_.read(I2C_ADDR, REG_SOC, 2);
         if (soc == null) {
-            server.log("error: could not read SoC charge percentage");
+            if (DEBUG) server.log("error: could not read SoC charge percentage");
             return;
         }
         soc = soc[0] + (soc[1] * (1.0/256.0));
@@ -190,7 +205,7 @@ class batt_monitor {
         const MV_PER_COUNT = 1.25;
         local voltage = i2c_.read(I2C_ADDR, REG_VCELL, 2);
         if (voltage ==null) {
-            server.log("error: could not read SoC monitor voltage");
+            if (DEBUG) server.log("error: could not read SoC monitor voltage");
             return;
         }
         voltage = to_int_(voltage) >> 4; // account for unused LSBs
@@ -204,7 +219,7 @@ class batt_monitor {
     this allows the system to only take action on large soc changes
     */
     function changed() {
-        const HYSTERESIS_PERCENT = 2.5; // only report a change if SoC has changed by more than this from last update
+        const HYSTERESIS_PERCENT = 0.5; // only report a change if SoC has changed by more than this from last update
         local soc = charge_percent();
         if (soc != null) {
             if (math.abs(soc - prev_soc) > HYSTERESIS_PERCENT) {
@@ -223,7 +238,7 @@ class batt_monitor {
         if (DEBUG) server.log("read SoC monitor version: ");
         local version = i2c_.read(I2C_ADDR, "\x08", 2);
         if (version == null) {
-            server.log("error: could not read SoC monitor version");
+            if (DEBUG) server.log("error: could not read SoC monitor version");
             return
         }
         // convert the bytes returned to a single integer value
@@ -250,6 +265,8 @@ class batt_monitor {
 performs setup of all hardware pins and system states
 */
 function setup() {
+    server.setsendtimeoutpolicy(SUSPEND_ON_ERROR, WAIT_TIL_SENT, 60.0);
+    
     // only connect to the server by default in debug mode, to reduce power draw
     if (DEBUG) server.connect();
     
@@ -265,6 +282,23 @@ function setup() {
     i2c.configure(CLOCK_SPEED_400_KHZ);
 }
 
+function send_signature() {
+    if (!server.isconnected()) server.connect();
+    while (!server.isconnected());
+    
+    server.log(format(  "********************************\n" +
+                        "TOILET MONITOR ONLINE\n" +
+                        "MAC: %s \nSSID: %s \nRSSI: %d \n" +
+                        "********************************\n",
+                        imp.getmacaddress(), imp.getssid(), imp.getrssi() ));
+    if (!DEBUG) {
+        server.log("disconnecting")
+        server.flush(30.0);
+        server.disconnect();
+    }
+}
+
+
 // ------------------------------------------
 // MAIN PROGRAM ENTRY POINT
 // ------------------------------------------
@@ -277,35 +311,40 @@ local rs = range_sensor(trig, echo);
 local d = detector(rs.weakref());
 local soc = batt_monitor(i2c);
 
+// let server know that we're online
+send_signature();
+
 function mainloop() {
     local cell_soc = 0.0;
     local cell_volts = 0.0;
 
     // detect state transitions
-    if(d.changed()) {
-        // connect to server (if we're not already), and wait for 
-        // connection to complete
-        if (!DEBUG) server.connect();
+    if(d.changed() || soc.changed() || DEBUG) {
+        // connect to server (if we're not already)
+        if (!server.isconnected()) server.connect();
         while (!server.isconnected());
-        server.log(d.state)
+        
+        // update state and range
+        server.log("range: " + rs.range_in + "in  state: " + d.state)
         agent.send("state", d.state);
-        if (!DEBUG) server.disconnect();
-    }   
+        agent.send("range", rs.range_in);
 
-    if (soc.changed() || DEBUG) {
+        // update soc
         cell_soc = soc.charge_percent();
         cell_volts = soc.voltage();
+        server.log("batt: " + cell_volts + "V  " + cell_soc + "%");
         agent.send("battery_status", [cell_soc, cell_volts]);
-    }
-
-    
-    if (DEBUG) {
-        local range_in = rs.range_in();
-        agent.send("range", range_in);
-        server.log("range " + range_in + " inches");
+        
+        if (!DEBUG) {
+            server.log("disconnecting")
+            server.flush(30.0);
+            server.disconnect();
+        }
     }
 
     // sleep till next loop iteration
-    imp.wakeup(1.0, mainloop); 
+    imp.wakeup(0.5, mainloop); 
 }
 mainloop();
+
+server.onunexpecteddisconnect(function(unused){server.connect()});
